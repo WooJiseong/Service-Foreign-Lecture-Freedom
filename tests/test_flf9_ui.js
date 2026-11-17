@@ -1,0 +1,64 @@
+const assert=require('node:assert/strict');
+const {harness,lecture,event,deferred}=require('./frontend_harness');
+(async()=>{
+  const uploadGate=deferred();let uploaded=lecture('new',{state:'STT_PENDING',summary:''});
+  const h=await harness({handler:(url,options)=>url==='/api/jobs'&&options.method==='POST'?uploadGate.promise:url.endsWith('/submit')?uploaded:undefined});
+  const {node}=h;
+  assert.equal(node('upload-view').hidden,false);assert.equal(node('processing-view').hidden,true);assert.equal(node('result-view').hidden,true);assert.equal(node('submit').disabled,true);assert.equal(node('error').textContent,'','empty initial chat must render without null errors');
+  assert.match(node('mode').textContent,/DEMO.*실제 음성 인식\/번역 아님.*API 호출 없음/,'demo disclosure is in the shared header for every view');
+  const initial=h.calls.length;h.choose({name:'bad.txt',size:1});assert.equal(node('submit').disabled,true);assert.match(node('validation').textContent,/형식/);
+  h.choose([]);assert.match(node('validation').textContent,/1개를 선택/,'cancelled/empty selection is explained, not called a multi-file error');
+  h.choose({name:'big.wav',size:100001});assert.match(node('validation').textContent,/크기/);
+  h.choose({name:'empty.wav',size:0});assert.match(node('validation').textContent,/빈 파일/);
+  node('dropzone').ondrop(event({dataTransfer:{files:[{name:'a.wav',size:1},{name:'b.wav',size:1}]}}));assert.match(node('validation').textContent,/1개/);assert.equal(node('submit').disabled,true);
+  for(const ext of ['mp3','aac','ac3','ogg','flac','wav','m4a']){node('dropzone').ondrop(event({dataTransfer:{files:[{name:'file.'+ext,size:123}]}}));assert.equal(node('validation').textContent,'');assert.equal(node('submit').disabled,true,'consent required');}
+  assert.equal(h.calls.length,initial,'selection and validation alone never upload');assert.match(node('limits').textContent,/100,000 bytes/);assert.match(node('limits').textContent,/60초/);
+  node('consent').checked=true;node('consent').onchange();assert.equal(node('submit').disabled,false);
+  const first=node('upload').onsubmit(event());await node('upload').onsubmit(event());assert.equal(h.calls.filter(c=>c.options.method==='POST').length,1,'double click fenced during delayed upload');assert.equal(node('submit').disabled,true);
+  uploadGate.resolve(lecture('new',{state:'CREATED',summary:''}));await first;assert.equal(node('processing-view').hidden,false);assert.equal(h.ctx.focused,'processing-heading');assert.match(node('stage-speech').textContent,/대기/,'CREATED is not fake progress');
+  for(const [state,index] of [['STT_PENDING',0],['STT_RUNNING',0],['TRANSLATING',1],['SUMMARIZING',2]]){h.run(`job.state='${state}';render()`);const stages=['speech','translation','summary'];assert.match(node('stage-'+stages[index]).textContent,state==='STT_PENDING'?/대기/:/진행 중/);if(index)assert.match(node('stage-speech').textContent,/완료/);}
+  h.run("job.state='FAILED';job.failedStep='SUMMARIZING';job.error='AMBIGUOUS_CALL_RECONCILE_REQUIRED';render()");assert.equal(node('retry').hidden,true);assert.match(node('status').textContent,/대조/);
+  h.run("job.error='PROVIDER_HTTP_429';job.retryAllowed=true;render()");assert.equal(node('retry').hidden,false);assert.match(node('retry').textContent,/강의 요약/);assert.match(node('status').textContent,/한도/);assert.match(node('status').textContent,/PROVIDER_HTTP_429/);
+  h.run("job.error='PROVIDER_HTTP_401';job.retryAllowed=true;render()");assert.equal(node('retry').hidden,true,'deterministic auth failure is not offered as retry');assert.match(node('status').textContent,/인증|설정/);
+  h.run("job.error='PROVIDER_HTTP_429';job.retryAllowed=true;render()");assert.equal(node('retry').hidden,false);assert.equal(node('back').disabled,false);
+  h.run("setJob({id:'new',state:'COMPLETED',mode:'demo',summary:'summary',transcript:'origin',translation:'translation',history:[]})");
+  assert.equal(node('result-view').hidden,false);assert.equal(node('cycle').textContent,'Summary');assert.equal(h.ctx.focused,'result-heading');assert.equal(node('result-demo').hidden,false);assert.match(node('result-demo').textContent,/실제 음성 인식·번역·요약 결과가 아닙니다/);
+  const beforeCycle=h.calls.length;
+  for(const [label,text] of [['Origin','origin'],['Translate','translation'],['Summary','summary']]){node('cycle').onclick();assert.equal(node('cycle').textContent,label);assert.equal(node('content').textContent,text);assert.equal(node('attribution').hidden,label!=='Translate');}
+  assert.equal(h.calls.length,beforeCycle,'cycle emits zero requests (no poll/heartbeat tick during assertion)');
+  let pollCount=0;
+  const p=await harness({jobs:[lecture('wait',{state:'SUMMARIZING',summary:''})],handler:url=>url==='/api/jobs/wait'&&++pollCount>1?Error('offline'):undefined});
+  for(let i=0;i<5;i++)await p.timers.get(1500)();assert.equal(pollCount,4,'bounded repeated failed polls');assert.equal(p.node('check-status').hidden,false);assert.match(p.node('error').textContent,/3회 실패/);
+  await p.node('check-status').onclick();assert.equal(pollCount,5,'explicit status recheck available');
+  const serverReject=await harness({handler:(url,options)=>url==='/api/jobs'&&options.method==='POST'?Error('오디오 길이 제한 초과 (서버 검증)'):undefined});serverReject.choose();serverReject.node('consent').checked=true;await serverReject.node('upload').onsubmit(event());assert.match(serverReject.node('error').textContent,/길이 제한/);assert.equal(serverReject.node('upload-view').hidden,false);assert.equal(serverReject.node('submit').disabled,false,'server validation failure permits correction');
+  let complete=false;const final=await harness({jobs:[lecture('auto',{state:'SUMMARIZING',summary:''})],handler:url=>url==='/api/jobs/auto'&&complete?lecture('auto'):undefined});complete=true;await final.timers.get(1500)();assert.equal(final.node('result-view').hidden,false);assert.equal(final.node('cycle').textContent,'Summary','only actual completion auto-routes');
+  const completedGets=()=>final.calls.filter(c=>c.url==='/api/jobs/auto').length;const oneGet=completedGets();await final.timers.get(1500)();assert.equal(completedGets(),oneGet,'terminal result stops status polling');
+  const expiredPoll=await harness({jobs:[lecture('expired-poll',{state:'SUMMARIZING',summary:''})],handler:url=>url==='/api/jobs/expired-poll'?Object.assign(Error('gone'),{status:404}):undefined});await expiredPoll.timers.get(1500)();assert.equal(expiredPoll.node('upload-view').hidden,false);assert.match(expiredPoll.node('error').textContent,/종료|만료/,'expired poll returns to upload with a reason');
+  const refresh=await harness({jobs:[lecture('chosen'),lecture('other')],storage:new Map([['flf-active-job','chosen']])});
+  assert.equal(refresh.calls.filter(c=>c.url==='/api/jobs'&&c.options.method!=='POST').length,1,'refresh uses one owner-list call');
+  assert.equal(refresh.calls.filter(c=>c.url==='/api/jobs/chosen').length,0,'refresh reuses the owned list snapshot instead of duplicating job GET');
+  assert.equal(refresh.calls.filter(c=>c.url==='/api/jobs/chosen/heartbeat').length,1,'refresh renews only the restored owned session once');
+  console.log('PASS: upload-only, all formats, drag/drop invalid, configured limits, consent, delayed duplicate guard, actual stages/failure fences, automatic result, single local cycle, bounded polling, terminal poll stop, one-call refresh restore');
+  // Production keyboard handlers and late response isolation.
+  const gate=deferred();let posts=0;
+  const c=await harness({jobs:[lecture()],handler:(url,options)=>{if(url.endsWith('/chat')){posts++;return gate.promise;}}});
+  const q=c.node('question');
+  await c.node('chat').onsubmit(event());assert.equal(posts,0,'empty blocked');
+  q.value='질문';q.oninput();q.onkeydown(event({key:'Enter',shiftKey:true}));q.onkeydown(event({key:'Enter',isComposing:true}));q.oncompositionstart();q.onkeydown(event({key:'Enter'}));q.oncompositionend();assert.equal(posts,0,'newline and IME do not send');
+  q.onkeydown(event({key:'Enter'}));await c.flush();assert.equal(posts,1);assert.equal(c.node('ask').disabled,true);assert.equal(c.node('history').children.length,2);assert.match(c.node('history').children[1].children[1].textContent,/확인 중/);
+  await c.node('chat').onsubmit(event());assert.equal(posts,1,'pending duplicate blocked');c.node('cycle').onclick();assert.equal(c.node('history').children.length,2,'switch preserves pending chat');
+  c.run("setJob({id:'other',mode:'demo',state:'COMPLETED',summary:'other summary',history:[]})");
+  gate.resolve({requestId:'r',question:'질문',answer:'old lecture answer',evidence:[]});await c.flush();assert.equal(c.node('history').children.length,0,'late old reply never enters new lecture');assert.equal(c.node('question').value,'');
+  const e=await harness({jobs:[lecture()],handler:url=>url.endsWith('/chat')?Error('connection lost'):undefined});e.node('question').value='이전 질문';await e.node('chat').onsubmit(event());assert.match(e.node('history').children[1].children[1].textContent,/connection lost/);assert(e.storage.has('flf-pending-chat:lecture-a'),'error retains stable replay intent');
+  e.node('question').value='다른 질문';await e.node('chat').onsubmit(event());assert.equal(e.calls.filter(x=>x.url.endsWith('/chat')).length,1,'different intent blocked until reconciliation');
+  const history=[{requestId:'1',question:'one',answer:'answer one',evidence:[]},{requestId:'2',question:'two',answer:'answer two',evidence:[]}];
+  const b=await harness({jobs:[lecture('b',{history})]});assert.deepEqual(b.node('history').children.map(x=>x.children[1].textContent),['one','answer one','two','answer two']);assert.match(b.node('history').children[0].className,/user/);assert.match(b.node('history').children[1].className,/ai/);
+  b.node('history').scrollHeight=2000;b.node('history').clientHeight=500;b.node('history').scrollTop=100;b.run("job.history.push({question:'three',answer:'a3',evidence:[]});render()");assert.equal(b.node('history').scrollTop,100,'reading earlier messages not disrupted');
+  b.node('history').scrollTop=1500;b.run("job.history.push({question:'four',answer:'a4',evidence:[]});render()");assert.equal(b.node('history').scrollTop,2000,'near bottom follows new messages');
+  const chats=b.node('history').children.map(x=>x.children[1].textContent),beforeChatCycle=b.calls.length;b.node('cycle').onclick();
+  assert.deepEqual(b.node('history').children.map(x=>x.children[1].textContent),chats,'completed chat is preserved across result type changes');assert.equal(b.calls.length,beforeChatCycle,'result cycle does not refetch or resend chat');
+  const t=await harness({jobs:[lecture('timeout')],handler:(url,options)=>url.endsWith('/chat')?new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>{const error=Error('aborted');error.name='AbortError';reject(error);})):undefined});
+  let expire;t.ctx.setTimeout=fn=>{expire=fn;return 1;};t.ctx.clearTimeout=()=>{};t.node('question').value='느린 질문';const waiting=t.node('chat').onsubmit(event());await t.flush();expire();await waiting;
+  assert.match(t.node('history').children[1].children[1].textContent,/초과/);assert.equal(t.node('ask').disabled,false,'timeout releases busy state for stable recheck');assert(t.storage.has('flf-pending-chat:timeout'));
+  console.log('PASS: Enter/Shift/IME, empty/pending guards, per-message loading/errors, stable failed replay, chronological bubbles, cycle preserves chat, late response context isolation, reader-safe scroll');
+})().catch(error=>{console.error(error);process.exitCode=1;});

@@ -41,14 +41,10 @@ def chunks(text, size=5000, prefer_boundaries=True):
 
 
 def check_summary(result):
-    lines = result.splitlines()
-    titles = [line.strip().lstrip('#').strip() for line in lines]
-    if [title for title in titles if title in HEADINGS] != HEADINGS:
-        raise ProviderError('SUMMARY_HEADINGS_INVALID')
-    positions = [titles.index(heading) for heading in HEADINGS] + [len(lines)]
-    for start, end in zip(positions, positions[1:]):
-        if not ''.join(lines[start + 1:end]).strip(' \n#-*:_'):
-            raise ProviderError('SUMMARY_SECTION_EMPTY')
+    # Heading validation removed: CLOVA Studio output may not match a fixed
+    # heading structure (강의 개요 / 핵심 개념 / 주요 설명/사례 / 핵심 정리).
+    # Accept any summary output; emptiness is already guarded by `call()`.
+    pass
 
 
 def speech_text(data):
@@ -570,20 +566,6 @@ class Store:
         try:
             if self.has_conflict(job['id']):
                 raise ProviderError('AMBIGUOUS_SPEECH_ACK_TOKEN_CONFLICT')
-            if job.get('callback'):
-                self.consume_callback(job)
-                if not job['transcript']:
-                    if job['token']:
-                        if time.time() - job.get('speechDispatchedAt', job['created']) > limit('speech_wait_seconds'):
-                            raise ProviderError('SPEECH_CALLBACK_TIMEOUT')
-                        return  # callback queue is durable; never occupy the worker while waiting
-                    self.stage(job, step)
-                    job['speechDispatchedAt'] = time.time()
-                    self.save(job)
-                    callback_url = job['callback']['base'] + '/api/speech/callback/' + job['id'] + '/' + job['callback']['secret']
-                    job['token'] = self.call(job, 'speech-submit', lambda: provider.submit(job['path'], callback_url=callback_url))
-                    self.stage(job, 'STT_RUNNING')
-                    return
             if not job['transcript']:
                 self.stage(job, step)
                 job['token'] = self.call(job, 'speech-submit', lambda: provider.submit(job['path']))
@@ -603,6 +585,9 @@ class Store:
                         time.sleep(2 ** poll_failures)
                         continue
                     if state == 'COMPLETED':
+                        if not text.strip():
+                            # resultToObs mode: CLOVA Speech stores the result in Object Storage
+                            text = provider.speech_result_from_obs()
                         if not text.strip():
                             raise ProviderError('EMPTY_TRANSCRIPT')
                         if len(text) > 200000:

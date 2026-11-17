@@ -361,7 +361,13 @@ def owned(request, id, allow_deleting=False):
 
 def public(job):
     return {**{k: v for k, v in job.items() if k not in ('owner', 'path', 'token', 'objects', 'mediaDigest', 'uploadMarker', 'callback', 'speechReceipt')},
-            'quarantined': 'leaseUntil' not in job}
+            'quarantined': 'leaseUntil' not in job,
+            # UI hint only; retry endpoint independently enforces the same durable fences.
+            'retryAllowed': (job['state'] == 'FAILED' and bool(job.get('failedStep'))
+                             and 'leaseUntil' in job
+                             and not job.get('legacyReadOnly') and not job.get('callbackError')
+                             and not (job.get('error') or '').startswith('AMBIGUOUS')
+                             and not store.has_uncertain(job['id']))}
 
 
 @app.get('/api/session')
@@ -587,8 +593,7 @@ def chat(request: Request, id: str, question: Question):
             raise HTTPException(409, '현재 서버 모드와 작업 모드가 다릅니다.')
         if not job['summary']:
             raise HTTPException(409, '요약 완료 후 질문할 수 있습니다.')
-        refs = evidence(job, question.text)
-        data = {'summary': job['summary'], 'evidence': refs,
+        data = {'summary': job['summary'], 'translation': job['translation'],
                 'history': job['history'][-4:], 'question': question.text}
         try:
             reservation = store.chat_reserve(job, question.requestId, question.text, data)
@@ -597,25 +602,23 @@ def chat(request: Request, id: str, question: Question):
         if reservation['state'] == 'done':
             return json.loads(reservation['turn'])
         data = json.loads(reservation['context'])
-        refs = data['evidence']
         answer = INSUFFICIENT
-        if refs:
-            if provider.mode == 'demo':
-                answer = '[데모: 인용 자료만 표시합니다]\n' + refs[0]['text']
-            else:
-                try:
-                    key = 'chat-' + question.requestId + '-' + hashlib.sha256(question.text.encode()).hexdigest()
-                    if reservation['state'] == 'failed':
-                        store.approve_retry(id, key)
-                    answer = store.call(job, key, lambda: provider.studio(
-                        '요약 및 인용 근거만으로 답변하고 [source 번호]를 인용하세요. '
-                        '근거가 불충분하면 다음 문장만 답하세요: ' + INSUFFICIENT, data))
-                except ProviderError as e:
-                    if e.code == 'SESSION_ENDED':
-                        raise HTTPException(410, '강의 세션이 종료되었습니다.') from None
-                    store.chat_failed(id, question.requestId, e.code.startswith('AMBIGUOUS'))
-                    raise HTTPException(502, e.code) from None
-        turn = {'requestId': question.requestId, 'question': question.text, 'answer': answer, 'evidence': refs}
+        if provider.mode == 'demo':
+            answer = '[데모: 인용 자료만 표시합니다]\n' + job['translation'][:200]
+        else:
+            try:
+                key = 'chat-' + question.requestId + '-' + hashlib.sha256(question.text.encode()).hexdigest()
+                if reservation['state'] == 'failed':
+                    store.approve_retry(id, key)
+                answer = store.call(job, key, lambda: provider.studio(
+                    '요약 및 번역문을 바탕으로 답변하세요. '
+                    '근거가 불충분하면 다음 문장만 답하세요: ' + INSUFFICIENT, data))
+            except ProviderError as e:
+                if e.code == 'SESSION_ENDED':
+                    raise HTTPException(410, '강의 세션이 종료되었습니다.') from None
+                store.chat_failed(id, question.requestId, e.code.startswith('AMBIGUOUS'))
+                raise HTTPException(502, e.code) from None
+        turn = {'requestId': question.requestId, 'question': question.text, 'answer': answer}
         try:
             store.chat_finish(id, turn)
         except ProviderError:

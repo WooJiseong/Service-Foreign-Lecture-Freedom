@@ -31,10 +31,25 @@ FLF_MODE=demo .venv/bin/uvicorn app:app --host 127.0.0.1 --port 10000 --workers 
 uvicorn의 `--host`, `--port`, `--workers` 옵션은 명령행에서 지정합니다. `--env-file`은
 필요 없습니다. 변수/모델 변경은 재시작해야 합니다. 단일 프로세스/worker만 지원합니다.
 
-접속 http://127.0.0.1:10000 → 데모 WAV 만들기 → 동의 → 제출. 파일 선택만으로 전송하지
+접속 http://127.0.0.1:10000 → 데모 WAV 선택 → 동의 → 제출. 파일 선택만으로 전송하지
 않습니다. 각 새 제출은 동일 파일이어도 별도 강의/Q&A 세션입니다. 전송 실패 시 같은
-업로드 요청 ID로만 재시도합니다. 강의 목록/조회/탭 전환은 유료 API를 재호출하지 않습니다.
+업로드 요청 ID로만 재시도합니다. 결과 조회/유형 전환은 유료 API를 재호출하지 않습니다.
 명시적 세션 종료는 새로고침과 다릅니다. 비정상 종료는 heartbeat lease 만료로 정리합니다.
+
+### UI 확인 (로컬 demo 실행 후)
+
+1. 새 세션은 업로드 화면만 표시합니다. 파일 선택/끌어 놓기 → 이름·크기·서버 한도 확인 →
+   전송 동의 → **변환 및 요약**. 미지원/빈 파일/크기 초과는 이유와 함께 제출을 차단합니다.
+   형식 진위와 길이는 서버에서 최종 검증합니다.
+2. 처리 화면의 음성 인식 → 한국어 번역 → 강의 요약 상태를 확인합니다. 실제 완료 후에만
+   결과·질문 화면으로 이동합니다. 오류 시 허용된 단계만 재시도하거나 세션을 종료합니다.
+3. 결과 버튼은 현재 유형 **Summary → Origin → Translate → Summary** 순환입니다.
+   저장된 내용만 바꾸며 채팅은 유지합니다. Translate에서 Papago 표기를 확인합니다.
+4. 질문은 Enter 전송, Shift+Enter 줄바꿈입니다. 한글 조합 중 Enter는 전송하지 않습니다.
+   응답 대기/오류는 해당 질문 아래 표시됩니다. 새 강의 시작/처음으로는 확인 후 현재
+   세션을 종료합니다. 새로고침은 소유한 활성 강의를 복구하며 종료/새 처리 호출이 아닙니다.
+5. 데스크톱 나란히/좁은 화면 세로 배치, 키보드 포커스·복사·스크롤은 실제 브라우저에서
+   별도 확인하세요. 자동 검증 범위/임시 UI 결정: [FLF-9 구현 기록](docs/FLF9_UI.md).
 
 ## 환경 변수 — 서버 전용
 
@@ -49,7 +64,7 @@ uvicorn의 `--host`, `--port`, `--workers` 옵션은 명령행에서 지정합�
 |`FLF_CONFIG`|루트 `service.yaml`; 상대 경로는 프로젝트 루트 기준|
 |`FLF_ALLOWED_HOSTS`|`localhost,127.0.0.1,testserver`; 배포 시 `101.79.23.235`|
 |`FLF_SECURE_COOKIE`|로컬 기본 미설정/`0`; HTTPS 배포는 `1` 필수|
-|`FLF_TRANSLATION_LABEL`|`Transition`|
+|`FLF_TRANSLATION_LABEL`|`Transition`; legacy API 호환용. FLF-9 UI는 표시명 **Translate**를 사용하며 내부 `translation`/`transcript` 키는 유지|
 |`FLF_PUBLIC_BASE_URL`|live 필수, 공개 HTTPS origin (예: `https://101.79.23.235`); 인증된 Speech callback URL 생성|
 |`TMPDIR`|Python 표준 임시 경로; systemd 예시는 서비스 전용 `/tmp` 256MiB tmpfs quota. YAML 상향 시 함께 검토|
 |`CLOVA_SPEECH_SECRET_KEY`|live 필수, Speech 콘솔의 비밀 인증키|
@@ -121,6 +136,7 @@ python -m pytest -q
 node tests/test_chat_transport.js
 node tests/test_frontend_storage.js
 node tests/test_session_lifecycle.js
+node tests/test_flf9_ui.js
 python tests/smoke_server.py
 python -m compileall -q app.py core.py providers.py config.py media_runner.py
 ```

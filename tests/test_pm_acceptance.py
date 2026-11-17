@@ -220,7 +220,7 @@ def test_ac12_papago_official_text_fallback_and_link_on_result_screen(client):
     page=client.get('/').text; parser=Attribution(); parser.feed(page)
     assert parser.text=='Papago 번역' and parser.attrs['href']=='https://papago.naver.com/'
     assert 'noopener' in parser.attrs['rel']
-    assert page.index('id="content"')<page.index('id="papago-attribution"')<page.index('<h2>강의 질문')
+    assert page.index('id="content"')<page.index('id="papago-attribution"')<page.index('id="chat-heading"')
     css=client.get('/static/style.css').text
     assert '.papago-attribution{font-family:system-ui,sans-serif;font-size:14px}' in css
     assert '데모 고정 예시에는 Papago API를 사용하지 않습니다' in page

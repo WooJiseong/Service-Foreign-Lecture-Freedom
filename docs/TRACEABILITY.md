@@ -10,7 +10,7 @@
 |---|---|---|---|
 |AC01|작업 생성·단계 전이|`test_explicit_submit`, `test_ac01_ac02_complete_stages_and_three_nonempty_outputs`, HTTP smoke|로컬 demo|
 |AC02|영문 전사·한국어 번역·요약 모두 nonempty|`test_ac01_ac02_complete_stages_and_three_nonempty_outputs`|고정 demo 언어/비어 있지 않음; live 품질 아님|
-|AC03|탭 변경 시 제공자 호출 없음|`test_tabs_read_only`, `node tests/test_frontend_storage.js` 실제 탭 handler 호출 검사|Python API + mock DOM/Node; 브라우저 E2E 별도|
+|AC03|탭 변경 시 제공자 호출 없음|`test_result_cycle_read_only`, `node tests/test_flf9_ui.js`/`test_frontend_storage.js` 실제 handler 호출 검사|FLF-9 UI는 세 탭 대신 단일 순환 버튼(내부 키 유지). Python API + mock DOM/Node; 브라우저 E2E 별도|
 |AC04|근거 기반 한국어 채팅·대화 이력|`test_fr23_ac04_every_actual_outbound_chat_system_contains_untrusted_summary`, `test_chat_context_and_isolation`|실제 어댑터 outbound role/payload를 mock transport로 확인|
 |AC05|지원되지 않는 질문에 부족 근거 응답|`test_f2_followup_summary_paraphrase_and_job_isolation`, `test_chat_context_and_isolation`|로컬 retrieval/demo|
 |AC06|5000자 초과 입력 전체·순서 보존|`test_fr12_ac06_paragraph_sentence_boundaries_and_oversized_sentence`, `test_fr12_ac06_ac07_stable_manifest_failed_chunks_only_order_and_exact_merge`|lossless source partition + mock 번역 exact merge|
@@ -32,7 +32,7 @@
 |AT05|live STT|**PENDING** — mock 계약 검사만 수행|
 |AT06|live translation|**PENDING** — mock 계약/분할/복구 검사만 수행|
 |AT07|summary|로컬 계층 요약·제목/내용·retry 테스트; live 의미 품질 미검증|
-|AT08|tabs|로컬 API 및 Node handler 검사; 실제 브라우저 시각/키보드 E2E 미완료|
+|AT08|tabs|FLF-9 결과 유형 순환 버튼으로 대체(A-1 탭 문구 충돌은 `FLF9_UI.md`에 기록). 로컬 API 및 Node handler 검사; 실제 브라우저 시각/키보드 E2E 미완료|
 |AT09|chat|로컬 mock/demo 근거·이력·SYSTEM context·격리·replay 검사; live 평가 미완료|
 |AT10|평가자 연결|**PENDING** — `101.79.23.235:10000` 배포/연결 미검증|
 |AT11|비허용 IP 차단|**PENDING** — pre-app ACL runbook만 제공, 실제 출발지 차단 미검증|
@@ -42,6 +42,6 @@
 - **FR12:** 문단→문장→최대 길이 강제 분할, 원문 문자/공백 전체 보존, 영속 chunk manifest와 내용 해시 ID. 이미 과금된 구 Draft 부분 작업은 기존 v1 경계를 유지해 재과금을 피한다.
 - **FR23:** 모든 outbound Chat SYSTEM에 요약 JSON을 명시적 untrusted quote 경계로 포함. transcript/history/question은 USER 데이터로만 전달한다.
 - **F1–F6:** 기존 scoped PASS 유지 여부를 회귀 테스트로 재확인. full/live VERIFIED 아님.
-- **N1:** storage 접근/쓰기 차단에도 앱 부팅·업로드·탭·결과는 동작. paid chat만 차단하고 demo는 메모리 fallback.
+- **N1:** storage 접근/쓰기 차단에도 앱 부팅·업로드·결과 유형 전환은 동작. paid chat만 차단하고 demo는 메모리 fallback.
 - **N2:** capacity 선검사 때문에 기존 동일 파일 업로드도 한도에서 거부될 수 있음. 기존 job 조회/선택을 사용하며 이 보수적 정책을 문서화.
 - **N3:** 삭제 intent/tombstone을 unlink 전에 commit; unlink 후 DB 완료 실패 시 runnable job으로 돌아가지 않고 숨김·복구 가능 상태를 유지.

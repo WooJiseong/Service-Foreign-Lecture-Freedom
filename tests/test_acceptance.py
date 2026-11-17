@@ -141,14 +141,16 @@ def test_hierarchy_and_summary_retry(tmp_path):
     assert all(h in j['summary'] for h in HEADINGS)
 
 
-def test_tabs_read_only(client):
+def test_result_cycle_read_only(client):
     j=completed(client)
     with module.store.connect() as c: before=c.execute('SELECT sum(attempts) FROM calls').fetchone()[0]
     for _ in range(4): assert client.get('/api/jobs/'+j['id']).status_code==200
     with module.store.connect() as c: assert c.execute('SELECT sum(attempts) FROM calls').fetchone()[0]==before
     js=client.get('/static/app.js').text
     assert "selectTab('summary')" in js
-    assert 'ArrowRight' in js
+    assert "$('cycle').onclick" in js
+    page=client.get('/').text
+    assert 'role="tab"' not in page and 'id="cycle"' in page
 
 
 def test_chat_context_and_isolation(client):
