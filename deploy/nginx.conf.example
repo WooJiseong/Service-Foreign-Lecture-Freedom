@@ -1,22 +1,56 @@
-# Server block template only. TLS certificate paths must be provisioned first.
+# http {} context (e.g. sites-enabled). TEMPLATE ONLY; no activation approved.
+# Operator installs ONE of access-evaluator.conf.example / access-public.conf.example.
+include /etc/nginx/flf-access.conf;
+# TEMPORARY_DECISION, not an approved cost budget. Direct peer only; no XFF trust.
+limit_req_zone $binary_remote_addr zone=flf_api:10m rate=5r/s;
+map $request_method $flf_upload_key { default ""; POST $binary_remote_addr; }
+limit_req_zone $flf_upload_key zone=flf_upload:10m rate=2r/m;
+limit_req_zone $binary_remote_addr zone=flf_callback:5m rate=10r/s;
+limit_req_status 429;
 server {
-    listen 10000 ssl;
+    listen 10000;
+    server_name 101.79.23.235;
+    if ($flf_allowed = 0) { return 403; }
+    return 308 https://101.79.23.235$request_uri;
+}
+server {
+    listen 443 ssl;
     server_name 101.79.23.235;
     ssl_certificate /etc/flf/tls/fullchain.pem;
     ssl_certificate_key /etc/flf/tls/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-
-    # Pre-application ACL: never trust arbitrary X-Forwarded-For.
-    allow 222.108.72.113/32;
-    deny all;
     client_max_body_size 101m;
     client_body_timeout 30s;
+    client_body_buffer_size 64k;
+    client_body_temp_path /var/lib/nginx/flf-client-body 1 2;
     access_log off;
-    location / {
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_http_version 1.1;
+    proxy_next_upstream off; # Never replay an upload/paid POST after partial transmission.
+    proxy_next_upstream_tries 1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_read_timeout 180s;
+    location ^~ /api/speech/callback/ {
+        # Capability-authenticated provider delivery, NOT anonymous browser ownership.
+        # Evaluator ACG/provider ingress exception needs separate approval (runbook).
+        client_max_body_size 8m;
+        limit_req zone=flf_callback burst=20 nodelay;
+        access_log off;
+        error_log /dev/null; # callback URL contains a per-job secret: never log URI.
         proxy_pass http://127.0.0.1:10001;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_read_timeout 180s;
+    }
+    location = /api/jobs {
+        if ($flf_allowed = 0) { return 403; }
+        limit_req zone=flf_api burst=20 nodelay;
+        limit_req zone=flf_upload burst=2 nodelay;
+        proxy_pass http://127.0.0.1:10001;
+    }
+    location / {
+        if ($flf_allowed = 0) { return 403; }
+        limit_req zone=flf_api burst=20 nodelay;
+        proxy_pass http://127.0.0.1:10001;
     }
 }

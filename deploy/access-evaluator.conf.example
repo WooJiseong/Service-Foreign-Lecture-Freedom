@@ -1,0 +1,5 @@
+# geo uses the direct peer; do not enable real_ip from arbitrary clients.
+geo $flf_allowed {
+    default 0;
+    222.108.72.113/32 1;
+}

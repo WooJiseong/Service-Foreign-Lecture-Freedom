@@ -24,6 +24,12 @@ def wav():
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    for key, value in {'NCLOUD_OBJECT_STORAGE_BUCKET':'mock-bucket',
+                       'FLF_PUBLIC_BASE_URL':'https://callback.invalid',
+                       'NCLOUD_OBJECT_STORAGE_ENDPOINT':'https://storage.invalid',
+                       'NCLOUD_OBJECT_STORAGE_INPUT_PREFIX':'flf/input',
+                       'NCLOUD_OBJECT_STORAGE_OUTPUT_PREFIX':'flf/output'}.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(module, 'store', Store(tmp_path))
     monkeypatch.setattr(module, 'provider', Providers('demo'))
     with TestClient(module.app) as c:
@@ -41,8 +47,8 @@ def upload(c, data=None, name='lecture.wav'):
     return c.post('/api/jobs', files={'audio': (name, data if data is not None else wav())}, data={'consent': 'true'})
 
 
-def completed(c):
-    j = upload(c).json()
+def completed(c, j=None):
+    j = j or upload(c).json()
     c.post(f"/api/jobs/{j['id']}/submit")
     for _ in range(60):
         j = c.get('/api/jobs/' + j['id']).json()
@@ -72,9 +78,9 @@ def test_real_validation(client, tmp_path):
     assert client.post('/api/jobs', files={'audio': ('x.wav', wav())}).status_code == 400
 
 
-def test_dedup(client):
+def test_independent_uploads(client):
     a = upload(client).json(); b = upload(client).json()
-    assert a['id'] == b['id']
+    assert a['id'] != b['id']
     j = completed(client)
     with module.store.connect() as c:
         before = c.execute('SELECT sum(attempts) FROM calls').fetchone()[0]
@@ -85,17 +91,18 @@ def test_dedup(client):
 
 def test_async_contract(monkeypatch, tmp_path):
     p = Providers('demo'); p.mode = 'live'
-    monkeypatch.setenv('SPEECH_URL', 'https://example.invalid/domain')
-    monkeypatch.setenv('SPEECH_KEY', 'unit-test-not-a-key')
+    monkeypatch.setenv('CLOVA_SPEECH_INVOKE_URL', 'https://example.invalid/domain')
+    monkeypatch.setenv('CLOVA_SPEECH_SECRET_KEY', 'unit-test-not-a-key')
     calls = []
     def mock(method, url, **kw):
         calls.append((method, url, kw))
         return {'result': 'SUCCEEDED', 'token': 'token'} if method == 'POST' else {'result': 'COMPLETED', 'segments': [{'text': 'full'}, {'text': 'lecture'}]}
     monkeypatch.setattr(p, 'request', mock)
     path = tmp_path / 'a.wav'; path.write_bytes(wav())
-    assert p.submit(path) == 'token'
+    assert p.submit(path, callback_url='https://callback.invalid/test-only') == 'token'
     params = json.loads(calls[0][2]['files']['params'][1])
-    assert params == {'language':'en-US','completion':'async','fullText':True,'resultToObs':True}
+    assert params == {'language':'en-US','completion':'async','fullText':True,'resultToObs':False,
+                      'callback':'https://callback.invalid/test-only'}
     assert p.poll('token') == ('COMPLETED', 'full lecture')
 
 
@@ -148,7 +155,7 @@ def test_chat_context_and_isolation(client):
     j=upload(client).json(); url=f"/api/jobs/{j['id']}/chat"
     q={'text':'에너지', 'requestId':'1234567890123456'}
     assert client.post(url,json=q).status_code==409
-    j=completed(client)
+    j=completed(client, j)
     turn=client.post(url,json=q).json()
     assert turn['evidence']
     assert client.post(url,json=q).json()==turn
@@ -191,7 +198,7 @@ def test_retry_policy(tmp_path,monkeypatch):
 def test_health_privacy_delete(client):
     assert client.get('/health').json()=={'status':'ok','mode':'demo'}
     page=client.get('/')
-    assert '7일' in page.text and '선택만으로' in page.text
+    assert 'heartbeat' in page.text and '선택만으로' in page.text
     assert "frame-ancestors 'none'" in page.headers['content-security-policy']
     j=upload(client).json()
     assert client.delete('/api/jobs/'+j['id']).status_code==200

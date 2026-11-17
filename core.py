@@ -1,8 +1,10 @@
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +12,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from config import limit
 
 from providers import HEADINGS, ProviderError
 
@@ -46,6 +49,26 @@ def check_summary(result):
     for start, end in zip(positions, positions[1:]):
         if not ''.join(lines[start + 1:end]).strip(' \n#-*:_'):
             raise ProviderError('SUMMARY_SECTION_EMPTY')
+
+
+def speech_text(data):
+    text = data.get('text')
+    if text is None:
+        segments = data.get('segments', [])
+        if not isinstance(segments, list) or len(segments) > 50000:
+            raise ProviderError('CALLBACK_TEXT_INVALID')
+        parts, length = [], 0
+        for segment in segments:
+            if not isinstance(segment, dict) or not isinstance(segment.get('text'), str):
+                raise ProviderError('CALLBACK_TEXT_INVALID')
+            length += len(segment['text']) + 1
+            if length > 200000:
+                raise ProviderError('TRANSCRIPT_CAP')
+            parts.append(segment['text'])
+        text = ' '.join(parts)
+    if not isinstance(text, str) or not text.strip() or len(text) > 200000:
+        raise ProviderError('CALLBACK_TEXT_INVALID')
+    return text
 
 
 def media_process(command, timeout):
@@ -100,6 +123,10 @@ class Store:
               CREATE TABLE IF NOT EXISTS chat_requests(job TEXT, request_id TEXT, question TEXT,
                 state TEXT, context TEXT, turn TEXT, PRIMARY KEY(job,request_id));
               CREATE TABLE IF NOT EXISTS deletions(job TEXT PRIMARY KEY, path TEXT, created REAL);
+              CREATE TABLE IF NOT EXISTS ended_uploads(key TEXT PRIMARY KEY);
+              CREATE TABLE IF NOT EXISTS upload_staging(path TEXT PRIMARY KEY, created REAL);
+              CREATE TABLE IF NOT EXISTS speech_results(job TEXT PRIMARY KEY, token TEXT, digest TEXT, text TEXT);
+              CREATE TABLE IF NOT EXISTS call_conflicts(job TEXT, key TEXT, code TEXT, PRIMARY KEY(job,key));
             ''')
             # Old Draft failures did not retain dispatch certainty. Fail closed
             # rather than permitting an upgrade to replay a possibly accepted POST.
@@ -107,12 +134,31 @@ class Store:
 
     def connect(self):
         c = sqlite3.connect(self.db, timeout=30)
-        c.execute('PRAGMA max_page_count=' + str(int(os.getenv('FLF_MAX_DB_BYTES', str(64 * 1024 ** 2))) // 4096))
+        c.execute('PRAGMA secure_delete=ON')
+        c.execute('PRAGMA max_page_count=' + str(limit('max_db_bytes') // 4096))
         c.row_factory = sqlite3.Row
         return c
 
     def save(self, job):
         with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT payload FROM jobs WHERE id=?', (job['id'],)).fetchone()
+            if not row or (current := json.loads(row[0])).get('deleting') or current.get('legacyReadOnly'):
+                return
+            for key in ('leaseUntil', 'heartbeatAt'):
+                if key in current:
+                    job[key] = current[key]
+            if current.get('callbackError'):
+                job.update(callbackError=current['callbackError'], state='FAILED',
+                           error=current['callbackError'], failedStep='STT_RUNNING',
+                           speechReceipt=current.get('speechReceipt'), token=current.get('token'))
+            conflict = c.execute('SELECT code FROM call_conflicts WHERE job=? LIMIT 1', (job['id'],)).fetchone()
+            if conflict:
+                job.update(state='FAILED', error=conflict[0], failedStep='STT_RUNNING')
+                confirmed = c.execute("SELECT value FROM calls WHERE job=? AND key='speech-submit' AND state='done'",
+                                      (job['id'],)).fetchone()
+                if confirmed:
+                    job['token'] = json.loads(confirmed[0])
             c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(job), job['id']))
 
     def get(self, id):
@@ -120,9 +166,117 @@ class Store:
             row = c.execute('SELECT payload FROM jobs WHERE id=?', (id,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def stage_upload(self, path):
+        """Commit intent BEFORE opening a new media file; never register legacy files."""
+        path = Path(path)
+        if path.parent.resolve() != self.root.resolve() or path.exists():
+            raise ValueError('Invalid new staging path')
+        with self.connect() as c:
+            c.execute('INSERT INTO upload_staging VALUES(?,?)', (str(path), time.time()))
+
+    def reconcile_staging(self, active_paths=()):
+        # Caller holds the app admission mutex; startup holds the process file lock.
+        with self.connect() as c:
+            rows = c.execute('SELECT path FROM upload_staging').fetchall()
+            if not rows:
+                return
+            referenced = {r[0] for r in c.execute("SELECT json_extract(payload,'$.path') FROM jobs")}
+            for row in rows:
+                path = row[0]
+                if path in active_paths:
+                    continue
+                if path not in referenced:
+                    candidate = Path(path)
+                    if candidate.parent.resolve() != self.root.resolve():
+                        raise ValueError('Invalid staging intent path')
+                    candidate.unlink(missing_ok=True)
+                c.execute('DELETE FROM upload_staging WHERE path=?', (path,))
+
+    def callback_auth(self, id, secret):
+        job = self.get(id)
+        if not job or job.get('deleting') or job.get('leaseUntil', 0) <= time.time():
+            return 'ended'
+        expected = job.get('callback', {}).get('secret', '')
+        return 'active' if expected and hmac.compare_digest(expected.encode(), secret.encode()) else 'denied'
+
+    def callback_pending(self, id):
+        with self.connect() as c:
+            return bool(c.execute('SELECT 1 FROM speech_results WHERE job=?', (id,)).fetchone())
+
+    def accept_callback(self, id, secret, data):
+        """Capability+provider token bind delivery to ONE attempted live job, not cookies."""
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT payload FROM jobs WHERE id=?', (id,)).fetchone()
+            if not row:
+                return False
+            job = json.loads(row[0])
+            if job.get('deleting') or job.get('leaseUntil', 0) <= time.time():
+                return False
+            if job['mode'] != 'live' or not hmac.compare_digest(job.get('callback', {}).get('secret', '').encode(), secret.encode()):
+                raise ProviderError('CALLBACK_DENIED')
+            if c.execute('SELECT 1 FROM call_conflicts WHERE job=?', (id,)).fetchone():
+                raise ProviderError('AMBIGUOUS_SPEECH_ACK_TOKEN_CONFLICT')
+            call = c.execute("SELECT * FROM calls WHERE job=? AND key='speech-submit'", (id,)).fetchone()
+            if not call or not job['submitted']:
+                raise ProviderError('CALLBACK_NO_DISPATCH')
+            token = data.get('token')
+            if not isinstance(token, str) or not 1 <= len(token) <= 256:
+                raise ProviderError('CALLBACK_TOKEN_INVALID')
+            expected = json.loads(call['value']) if call['state'] == 'done' else job.get('token')
+            if expected and not hmac.compare_digest(expected.encode(), token.encode()):
+                raise ProviderError('CALLBACK_TOKEN_MISMATCH')
+            state = data.get('result')
+            if state not in ('COMPLETED', 'FAILED', 'TIMEOUT'):
+                raise ProviderError('CALLBACK_STATE_INVALID')
+            text = speech_text(data) if state == 'COMPLETED' else ''
+            digest = hashlib.sha256((state + '\0' + text).encode()).hexdigest()
+            previous = c.execute('SELECT digest FROM speech_results WHERE job=?', (id,)).fetchone()
+            previous_digest = previous[0] if previous else job.get('speechReceipt')
+            if previous_digest:
+                if previous_digest != digest:
+                    raise ProviderError('CALLBACK_CONFLICT')
+                return True
+            if state == 'COMPLETED':
+                c.execute('INSERT INTO speech_results VALUES(?,?,?,?)', (id, token, digest, text))
+            else:
+                job.update(state='FAILED', failedStep='STT_RUNNING', error='SPEECH_CALLBACK_'+state,
+                           callbackError='SPEECH_CALLBACK_'+state, speechReceipt=digest, token=token)
+                c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(job), id))
+            if call['state'] != 'done':
+                changed = c.execute("UPDATE calls SET state='done',value=? WHERE job=? AND key='speech-submit' "
+                    "AND state=? AND attempts=? AND value IS ?",
+                    (json.dumps(token), id, call['state'], call['attempts'], call['value']))
+                if changed.rowcount != 1:
+                    raise ProviderError('AMBIGUOUS_CALL_RECONCILE_REQUIRED')
+            return True
+
+    def consume_callback(self, job):
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            conflict = c.execute('SELECT code FROM call_conflicts WHERE job=? LIMIT 1', (job['id'],)).fetchone()
+            if conflict:
+                raise ProviderError(conflict[0])
+            row = c.execute('SELECT * FROM speech_results WHERE job=?', (job['id'],)).fetchone()
+            current = c.execute('SELECT payload FROM jobs WHERE id=?', (job['id'],)).fetchone()
+            if not row or not current:
+                return False
+            payload = json.loads(current[0])
+            if payload.get('deleting') or payload.get('leaseUntil', 0) <= time.time():
+                return False
+            payload.update(transcript=row['text'], token=row['token'], speechReceipt=row['digest'],
+                           state='STT_RUNNING', error=None, failedStep=None)
+            c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(payload), job['id']))
+            c.execute('DELETE FROM speech_results WHERE job=?', (job['id'],))
+            job.update(payload)
+            return True
+
     def chat_reserve(self, job, request_id, question, context):
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
+            current = c.execute('SELECT payload FROM jobs WHERE id=?', (job['id'],)).fetchone()
+            if not current or (state := json.loads(current[0])).get('deleting') or state.get('leaseUntil', float('inf')) <= time.time():
+                raise ProviderError('SESSION_ENDED')
             row = c.execute('SELECT * FROM chat_requests WHERE job=? AND request_id=?', (job['id'], request_id)).fetchone()
             if row:
                 if row['question'] != question:
@@ -135,7 +289,7 @@ class Store:
                 return dict(row)
             if c.execute("SELECT 1 FROM chat_requests WHERE job=? AND state IN ('pending','uncertain')", (job['id'],)).fetchone():
                 raise ProviderError('CHAT_PENDING_RECONCILE_REQUIRED')
-            if c.execute('SELECT count(*) FROM chat_requests WHERE job=?', (job['id'],)).fetchone()[0] >= 20:
+            if c.execute('SELECT count(*) FROM chat_requests WHERE job=?', (job['id'],)).fetchone()[0] >= limit('max_chat_requests'):
                 raise ProviderError('CHAT_REQUEST_CAP')
             c.execute("INSERT INTO chat_requests VALUES(?,?,?,'pending',?,NULL)",
                       (job['id'], request_id, question, json.dumps(context)))
@@ -148,6 +302,8 @@ class Store:
             if not row:
                 raise ProviderError('CHAT_JOB_DELETED')
             job = json.loads(row[0])
+            if job.get('deleting') or job.get('leaseUntil', float('inf')) <= time.time():
+                raise ProviderError('CHAT_JOB_DELETED')
             if not any(t['requestId'] == turn['requestId'] for t in job['history']):
                 job['history'].append(turn)
             c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(job), job_id))
@@ -167,7 +323,12 @@ class Store:
 
     def has_uncertain(self, job_id):
         with self.connect() as c:
-            return bool(c.execute("SELECT 1 FROM calls WHERE job=? AND state IN ('inflight','uncertain')", (job_id,)).fetchone())
+            return bool(c.execute("SELECT 1 FROM calls WHERE job=? AND state IN ('inflight','uncertain')", (job_id,)).fetchone()
+                        or c.execute('SELECT 1 FROM call_conflicts WHERE job=?', (job_id,)).fetchone())
+
+    def has_conflict(self, job_id):
+        with self.connect() as c:
+            return bool(c.execute('SELECT 1 FROM call_conflicts WHERE job=?', (job_id,)).fetchone())
 
     def approve_retry(self, job_id, key=None):
         with self.connect() as c:
@@ -181,8 +342,19 @@ class Store:
             if not current:
                 return
             payload = json.loads(current[0])
+            if payload.get('deleting'):
+                return  # Durable intent already exists; do not rewrite it on every reaper tick.
+            if payload.get('uploadMarker'):
+                c.execute('INSERT OR IGNORE INTO ended_uploads VALUES(?)', (payload['uploadMarker'],))
             payload['deleting'] = True
+            # Remove private results/caches immediately, retain only cleanup metadata.
+            for key in ('transcript', 'translation', 'summary', 'history', 'token', 'translationPlan', 'callback', 'speechReceipt', 'callbackError'):
+                payload.pop(key, None)
             c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(payload), job['id']))
+            c.execute('DELETE FROM calls WHERE job=?', (job['id'],))
+            c.execute('DELETE FROM chat_requests WHERE job=?', (job['id'],))
+            c.execute('DELETE FROM speech_results WHERE job=?', (job['id'],))
+            c.execute('DELETE FROM call_conflicts WHERE job=?', (job['id'],))
             c.execute('INSERT OR IGNORE INTO deletions VALUES(?,?,?)', (job['id'], payload['path'], time.time()))
 
     def finish_delete(self, job_id):
@@ -190,8 +362,20 @@ class Store:
             c.execute('BEGIN IMMEDIATE')
             c.execute('DELETE FROM calls WHERE job=?', (job_id,))
             c.execute('DELETE FROM chat_requests WHERE job=?', (job_id,))
+            c.execute('DELETE FROM speech_results WHERE job=?', (job_id,))
+            c.execute('DELETE FROM call_conflicts WHERE job=?', (job_id,))
             c.execute('DELETE FROM jobs WHERE id=?', (job_id,))
             c.execute('DELETE FROM deletions WHERE job=?', (job_id,))
+
+    def defer_cleanup(self, job_id):
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT payload FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row:
+                job = json.loads(row[0])
+                attempts = min(job.get('cleanupAttempts', 0) + 1, 7)
+                job.update(cleanupAttempts=attempts, cleanupAfter=time.time()+min(5*2**(attempts-1), 300))
+                c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(job), job_id))
 
     def translation_plan(self, job):
         source = job['transcript']
@@ -216,14 +400,24 @@ class Store:
         self.save(job)  # Manifest is durable BEFORE the first new paid call.
         return entries
 
-    def create(self, owner, digest, mode, path):
+    def create(self, owner, digest, mode, path, request_id=None):
+        identity = request_id or str(uuid.uuid4())
+        marker = hashlib.sha256((owner + ':' + mode + ':' + identity).encode()).hexdigest()
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
+            if c.execute('SELECT 1 FROM ended_uploads WHERE key=?', (marker,)).fetchone():
+                raise ValueError('종료된 업로드 요청 ID입니다. 새 업로드가 필요합니다.')
             row = c.execute('SELECT payload FROM jobs WHERE owner=? AND digest=? AND mode=?',
-                            (owner, digest, mode)).fetchone()
+                            (owner, identity, mode)).fetchone()
             if row:
+                existing = json.loads(row[0])
+                if existing.get('mediaDigest') != digest or existing.get('deleting'):
+                    raise ValueError('업로드 요청 ID 충돌 또는 종료된 세션입니다.')
+                if existing.get('leaseUntil', float('inf')) <= time.time():
+                    raise ValueError('만료된 강의 세션입니다.')
                 Path(path).unlink(missing_ok=True)
-                return json.loads(row[0])
+                c.execute('DELETE FROM upload_staging WHERE path=?', (str(path),))
+                return existing
             if c.execute('SELECT count(*) FROM jobs WHERE owner=?', (owner,)).fetchone()[0] >= 10:
                 Path(path).unlink(missing_ok=True)
                 raise ValueError('보관 작업 한도 10개입니다. 기존 작업을 삭제하세요.')
@@ -231,52 +425,138 @@ class Store:
                        state='CREATED', failedStep=None, error=None, transcript='',
                        translation='', summary='', history=[], token=None, submitted=False,
                        created=time.time(), events=['CREATED'])
+            job.update(mediaDigest=digest, leaseUntil=time.time() + limit('lease_seconds'), heartbeatAt=time.time())
+            if request_id:
+                job['uploadMarker'] = marker
+            if mode == 'live':
+                job['callback'] = {'base': os.environ['FLF_PUBLIC_BASE_URL'].rstrip('/'), 'secret': secrets.token_hex(32)}
             c.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?)',
-                      (job['id'], owner, digest, mode, job['created'], json.dumps(job)))
+                      (job['id'], owner, identity, mode, job['created'], json.dumps(job)))
+            c.execute('DELETE FROM upload_staging WHERE path=?', (str(path),))
             return job
 
-    def call(self, job, key, fn):
+    def heartbeat(self, job_id):
         with self.connect() as c:
+            row = c.execute('SELECT payload FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not row:
+                return False
+            job = json.loads(row[0]); now = time.time()
+            if 'leaseUntil' not in job:
+                return False  # Quarantine requires an explicit owner decision, not auto heartbeat.
+            if job.get('deleting') or job.get('leaseUntil', float('inf')) <= now:
+                return False
+            if now - job.get('heartbeatAt', 0) < limit('heartbeat_seconds'):
+                return True  # multi-tab/public floods cause NO renewal writes
+            c.execute("UPDATE jobs SET payload=json_set(payload,'$.leaseUntil',?,'$.heartbeatAt',?) WHERE id=? "
+                      "AND NOT coalesce(json_extract(payload,'$.deleting'),0) "
+                      "AND coalesce(json_extract(payload,'$.leaseUntil'),?)>? "
+                      "AND coalesce(json_extract(payload,'$.heartbeatAt'),0)<=?",
+                      (now+limit('lease_seconds'), now, job_id, now+1, now, now-limit('heartbeat_seconds')))
+            return True
+
+    def adopt(self, job_id):
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT payload FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not row:
+                raise ProviderError('SESSION_ENDED')
+            job = json.loads(row[0])
+            if job.get('deleting') or 'leaseUntil' in job:
+                raise ProviderError('NOT_QUARANTINED')
+            job.update(leaseUntil=time.time()+limit('lease_seconds'), heartbeatAt=time.time(),
+                       submitted=False, legacyReadOnly=True)
+            c.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(job), job_id))
+            return job
+
+    def _call_guard(self, c, job):
+        current = c.execute('SELECT payload FROM jobs WHERE id=?', (job['id'],)).fetchone()
+        if 'owner' in job and (not current or json.loads(current[0]).get('deleting')
+                or json.loads(current[0]).get('leaseUntil', float('inf')) <= time.time()):
+            raise ProviderError('SESSION_ENDED')
+        if current and json.loads(current[0]).get('legacyReadOnly'):
+            raise ProviderError('LEGACY_READ_ONLY')
+        conflict = c.execute('SELECT code FROM call_conflicts WHERE job=? LIMIT 1', (job['id'],)).fetchone()
+        if conflict:
+            raise ProviderError(conflict[0])
+
+    def _reserve_call(self, job, key, retry_from):
+        """Re-read under the writer lock before EVERY dispatch, including backoff retries."""
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            self._call_guard(c, job)
             row = c.execute('SELECT * FROM calls WHERE job=? AND key=?', (job['id'], key)).fetchone()
             if row and row['state'] == 'done':
-                return json.loads(row['value'])
-            if row and row['state'] in ('inflight', 'uncertain'):
-                raise ProviderError('AMBIGUOUS_CALL_RECONCILE_REQUIRED')
-            if row and row['state'] == 'failed':
-                # Infra recovery must not redispatch a known failed request (e.g.
-                # bad credentials). Only explicit API retry grants approval.
+                return True, json.loads(row['value']), None
+            if row and row['state'] == 'failed' and retry_from != (row['attempts'], row['value']):
                 raise ProviderError(json.loads(row['value']))
+            if row and row['state'] not in ('failed', 'retry-approved'):
+                raise ProviderError('AMBIGUOUS_CALL_RECONCILE_REQUIRED')
             count = c.execute('SELECT coalesce(sum(attempts),0) FROM calls WHERE job=?', (job['id'],)).fetchone()[0]
-            if count >= 200:
+            if count >= limit('max_calls'):
                 raise ProviderError('JOB_CALL_CAP')
+            attempt = row['attempts'] + 1 if row else 1
+            if row:
+                changed = c.execute("UPDATE calls SET state='inflight',value=NULL,attempts=? "
+                    "WHERE job=? AND key=? AND state=? AND attempts=? AND value IS ?",
+                    (attempt, job['id'], key, row['state'], row['attempts'], row['value']))
+                if changed.rowcount != 1:
+                    raise ProviderError('AMBIGUOUS_CALL_RECONCILE_REQUIRED')
+            else:
+                c.execute("INSERT INTO calls(job,key,state,attempts) VALUES(?,?,'inflight',1)", (job['id'], key))
+            return False, None, attempt
+
+    def _settle_call(self, job, key, attempt, state, value):
+        """CAS only our inflight generation. A callback-confirmed done value is immutable."""
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            self._call_guard(c, job)
+            row = c.execute('SELECT * FROM calls WHERE job=? AND key=?', (job['id'], key)).fetchone()
+            if not row:
+                raise ProviderError('SESSION_ENDED')
+            if row['state'] == 'done':
+                confirmed = json.loads(row['value'])
+                if key == 'speech-submit' and state == 'done' and value != confirmed:
+                    code = 'AMBIGUOUS_SPEECH_ACK_TOKEN_CONFLICT'
+                    c.execute('INSERT OR IGNORE INTO call_conflicts VALUES(?,?,?)', (job['id'], key, code))
+                    # Return after COMMIT, not raise inside the transaction and roll back the fence.
+                    return 'conflict', code
+                return 'done', confirmed
+            changed = c.execute("UPDATE calls SET state=?,value=? WHERE job=? AND key=? "
+                "AND state='inflight' AND attempts=?",
+                (state, json.dumps(value), job['id'], key, attempt))
+            if changed.rowcount != 1:
+                raise ProviderError('AMBIGUOUS_CALL_RECONCILE_REQUIRED')
+            return state, value
+
+    def call(self, job, key, fn):
+        retry_from = None
         for attempt in range(3):
-            with self.connect() as c:
-                count = c.execute('SELECT coalesce(sum(attempts),0) FROM calls WHERE job=?', (job['id'],)).fetchone()[0]
-                if count >= 200:
-                    raise ProviderError('JOB_CALL_CAP')
-                c.execute("INSERT INTO calls(job,key,state,attempts) VALUES(?,?,'inflight',1) "
-                    "ON CONFLICT(job,key) DO UPDATE SET state='inflight', attempts=attempts+1", (job['id'], key))
+            cached, value, generation = self._reserve_call(job, key, retry_from)
+            if cached:
+                return value
             try:
                 value = fn()
                 if not isinstance(value, str) or not value.strip():
                     raise ProviderError('EMPTY_PROVIDER_OUTPUT')
             except ProviderError as e:
-                with self.connect() as c:
-                    c.execute('UPDATE calls SET state=?,value=? WHERE job=? AND key=?',
-                        ('uncertain' if e.code.startswith('AMBIGUOUS') else 'failed', json.dumps(e.code), job['id'], key))
+                status, confirmed = self._settle_call(job, key, generation,
+                    'uncertain' if e.code.startswith('AMBIGUOUS') else 'failed', e.code)
+                if status == 'done':
+                    return confirmed
                 if not e.transient or attempt == 2:
                     raise
+                retry_from = (generation, json.dumps(e.code))
                 time.sleep(2 ** attempt)
             except Exception:
-                # Unexpected parsing/shape errors after dispatch also fail closed.
-                with self.connect() as c:
-                    c.execute("UPDATE calls SET state='uncertain' WHERE job=? AND key=?", (job['id'], key))
+                status, confirmed = self._settle_call(job, key, generation, 'uncertain', 'AMBIGUOUS_PROVIDER_OUTPUT')
+                if status == 'done':
+                    return confirmed
                 raise ProviderError('AMBIGUOUS_PROVIDER_OUTPUT') from None
             else:
-                with self.connect() as c:
-                    c.execute("UPDATE calls SET state='done',value=? WHERE job=? AND key=?",
-                              (json.dumps(value), job['id'], key))
-                return value
+                status, confirmed = self._settle_call(job, key, generation, 'done', value)
+                if status == 'conflict':
+                    raise ProviderError(confirmed)
+                return confirmed
 
     def stage(self, job, state):
         job['state'] = state
@@ -284,15 +564,33 @@ class Store:
         self.save(job)
 
     def run(self, job, provider, stop=lambda: False):
+        if job.get('legacyReadOnly'):
+            raise ProviderError('LEGACY_READ_ONLY')
         step = 'STT_PENDING'
         try:
+            if self.has_conflict(job['id']):
+                raise ProviderError('AMBIGUOUS_SPEECH_ACK_TOKEN_CONFLICT')
+            if job.get('callback'):
+                self.consume_callback(job)
+                if not job['transcript']:
+                    if job['token']:
+                        if time.time() - job.get('speechDispatchedAt', job['created']) > limit('speech_wait_seconds'):
+                            raise ProviderError('SPEECH_CALLBACK_TIMEOUT')
+                        return  # callback queue is durable; never occupy the worker while waiting
+                    self.stage(job, step)
+                    job['speechDispatchedAt'] = time.time()
+                    self.save(job)
+                    callback_url = job['callback']['base'] + '/api/speech/callback/' + job['id'] + '/' + job['callback']['secret']
+                    job['token'] = self.call(job, 'speech-submit', lambda: provider.submit(job['path'], callback_url=callback_url))
+                    self.stage(job, 'STT_RUNNING')
+                    return
             if not job['transcript']:
                 self.stage(job, step)
                 job['token'] = self.call(job, 'speech-submit', lambda: provider.submit(job['path']))
                 self.save(job)
                 step = 'STT_RUNNING'
                 self.stage(job, step)
-                deadline = time.monotonic() + 7200
+                deadline = time.monotonic() + limit('speech_wait_seconds')
                 poll_failures = 0
                 while not stop():
                     try:

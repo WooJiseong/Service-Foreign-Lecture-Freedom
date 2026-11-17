@@ -18,7 +18,7 @@ def test_all_supported_actual_formats(tmp_path, extension):
 
 def test_official_papago_studio_contract(monkeypatch):
     p=Providers('demo'); p.mode='live'
-    for key in ('PAPAGO_ID','PAPAGO_SECRET','STUDIO_KEY'): monkeypatch.setenv(key,'mock-only')
+    for key in ('PAPAGO_CLIENT_ID','PAPAGO_CLIENT_SECRET','CLOVASTUDIO_API_KEY'): monkeypatch.setenv(key,'mock-only')
     calls=[]
     def request(method,url,**kw):
         calls.append((url,kw))
@@ -41,10 +41,10 @@ def test_http_auth_not_retried_and_ambiguous_transport(monkeypatch):
     p=Providers('demo')
     def denied(self,*a,**kw):
         return httpx.Response(401,json={'private':'do not expose'})
-    monkeypatch.setattr(httpx.Client,'request',denied)
+    monkeypatch.setattr(httpx.Client,'send',denied)
     with pytest.raises(ProviderError) as e: p.request('POST','https://example.invalid')
     assert e.value.code=='PROVIDER_HTTP_401' and not e.value.transient
     def timeout(self,*a,**kw): raise httpx.ReadTimeout('private request details')
-    monkeypatch.setattr(httpx.Client,'request',timeout)
+    monkeypatch.setattr(httpx.Client,'send',timeout)
     with pytest.raises(ProviderError) as e: p.request('POST','https://example.invalid')
     assert e.value.code=='AMBIGUOUS_TRANSPORT'

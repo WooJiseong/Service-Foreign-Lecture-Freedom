@@ -1,0 +1,31 @@
+# 비밀 값은 절대로 이 파일에 쓰지 않습니다.
+# 모델 우선순위: 역할별 YAML > CLOVASTUDIO_MODEL 공통 환경값 > HCX-005.
+# 공통 환경값을 쓰려면 해당 역할을 null로 바꾸거나 키를 제거하세요.
+# 요약(map/reduce 포함)과 질의응답 모델은 독립적으로 변경할 수 있습니다.
+models:
+  summary: HCX-005
+  chat: HCX-005
+# TEMPORARY_DECISION: 금액 예산 미확정. 무제한 호출 승인이 아닙니다.
+# 한도 우선순위: 대응 FLF_* 환경 변수 > YAML > 코드 기본값.
+# 양의 정수만 허용. 알 수 없는 키/잘못된 YAML은 시작을 차단합니다.
+limits:
+  max_bytes: 104857600 # 업로드 100 MiB
+  max_seconds: 7200 # 음성 120분
+  max_jobs: 50 # 전체 브라우저 활성 강의 세션 합계
+  max_queue: 20 # CREATED 포함 대기/처리 합계
+  max_storage: 2147483648 # multipart 임시 공간 포함 보수적 예산
+  max_db_bytes: 67108864 # SQLite 64 MiB
+  max_validations: 2 # 업로드/디코더 동시 실행
+  lease_seconds: 180 # TEMPORARY: 마지막 heartbeat 후 만료
+  heartbeat_seconds: 30 # TEMPORARY: lease의 절반 미만
+  max_calls: 200 # 강의당 유료 호출 시도 합계, 자동 재시도 포함
+  max_chat_requests: 20 # 강의당 질문 요청 ID 개수
+  reaper_milliseconds: 500 # TEMPORARY: 로컬 만료/staging 정리 주기 (0.5초)
+  cleanup_milliseconds: 500 # TEMPORARY: 독립 외부 삭제 큐 확인 주기
+  max_provider_response_bytes: 8388608 # HTTP 응답 및 callback JSON 파싱 전 8MiB 제한
+  speech_wait_seconds: 7200 # callback 대기 상한, max_seconds 이상
+# 안전 범위/교차검증은 config.BOUNDS: 업로드<=512MiB, 길이<=4시간,
+# 작업<=200, 큐<=100, 동시검증<=4, 저장<=20GiB, DB<=512MiB,
+# lease 30..3600초, heartbeat 5..120초 및 lease 절반 미만,
+# reaper/cleanup 100..5000ms, 응답 64KiB..16MiB, 호출<=1000, 질문<=100.
+# 검증동시수<=큐<=작업수, 저장>=DB+동시수*(2*업로드+1MiB) 필수.

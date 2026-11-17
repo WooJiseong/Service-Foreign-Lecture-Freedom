@@ -28,19 +28,21 @@ def wait_for(fn, timeout=12):
 def test_f1_accepted_speech_uncertainty_survives_restart_and_explicit_retry(client, monkeypatch, kind):
     j=upload(client).json(); id=j['id']
     internal=module.store.get(id); internal['mode']='live'; module.store.save(internal)
+    internal['callback']={'base':'https://callback.invalid','secret':'synthetic-test-only'} # pragma: allowlist secret -- synthetic callback fixture, not a credential
+    module.store.save(internal)
     p=Providers('demo'); p.mode='live'
     monkeypatch.setattr(module,'provider',p)
-    monkeypatch.setenv('SPEECH_URL','https://speech.invalid/domain')
-    monkeypatch.setenv('SPEECH_KEY','mock-only')
+    monkeypatch.setenv('CLOVA_SPEECH_INVOKE_URL','https://speech.invalid/domain')
+    monkeypatch.setenv('CLOVA_SPEECH_SECRET_KEY','mock-only')
     seen=[]
-    def accepted(self, method, url, **kwargs):
-        seen.append(method)
-        assert method=='POST'
+    def accepted(self, request, **kwargs):
+        seen.append(request.method)
+        assert request.method=='POST'
         if kind=='invalid-json': return httpx.Response(200,content=b'{broken')
         if kind=='invalid-ack': return httpx.Response(200,json={'result':'SUCCEEDED'})
         return httpx.Response(int(kind.split('-')[1]),content=b'gateway response')
     with monkeypatch.context() as request_patch:
-        request_patch.setattr(httpx.Client,'request',accepted)
+        request_patch.setattr(httpx.Client,'send',accepted)
         # Execute the isolated persisted stage directly (TestClient also uses httpx).
         module.store.run(internal,p)
         assert internal['error'].startswith('AMBIGUOUS')
@@ -129,7 +131,9 @@ def test_f3_queue_transient_failure_recovers(client,monkeypatch):
 
 def test_f3_ttl_unlink_failure_retains_row_and_recovers(client,monkeypatch):
     j=upload(client).json(); internal=module.store.get(j['id'])
-    internal['created']=time.time()-8*86400; module.store.save(internal)
+    with module.store.connect() as c:
+        c.execute("UPDATE jobs SET payload=json_set(payload,'$.leaseUntil',?) WHERE id=?",
+                  (time.time()-1, j['id']))
     real=Path.unlink; failures=[]
     def unlink(path,*a,**kw):
         if str(path)==internal['path'] and len(failures)<2:

@@ -1,0 +1,33 @@
+[Unit]
+Description=FLF anonymous temporary lecture service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flf
+Group=flf
+WorkingDirectory=/opt/flf
+EnvironmentFile=/etc/flf/flf.env
+Environment=FLF_DATA=/var/lib/flf
+Environment=FLF_ALLOWED_HOSTS=101.79.23.235
+Environment=FLF_SECURE_COOKIE=1
+ExecStart=/opt/flf/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 10001 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=110
+UMask=0077
+StateDirectory=flf
+NoNewPrivileges=true
+# TEMPORARY: default max_validations=2 * 100MiB multipart spool + margin.
+# Per-service private tmpfs, not a host /tmp cleanup command. Re-size with YAML limits.
+Environment=TMPDIR=/tmp
+TemporaryFileSystem=/tmp:rw,size=256M,mode=1777 /var/tmp:rw,size=16M,mode=1777
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/flf
+MemoryMax=1G
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

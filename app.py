@@ -10,9 +10,10 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from config import limit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -22,8 +23,8 @@ from core import Store, evidence, validate_audio
 from providers import Providers, ProviderError
 
 BASE = Path(__file__).parent
-MAX_BYTES = int(os.getenv('FLF_MAX_BYTES', 100 * 1024 * 1024))
-MAX_SECONDS = int(os.getenv('FLF_MAX_SECONDS', 7200))
+MAX_BYTES = limit('max_bytes')
+MAX_SECONDS = limit('max_seconds')
 os.umask(0o077)
 store = Store(os.getenv('FLF_DATA', str(BASE / 'data')))
 provider = Providers(os.getenv('FLF_MODE', 'demo'))
@@ -33,10 +34,15 @@ active = set()
 job_locks = {}
 worker_status = {'state': 'starting', 'failures': 0, 'error': None}
 worker_thread = None
-MAX_JOBS = int(os.getenv('FLF_MAX_JOBS', '50'))
-MAX_QUEUE = int(os.getenv('FLF_MAX_QUEUE', '20'))
-MAX_STORAGE = int(os.getenv('FLF_MAX_STORAGE', str(2 * 1024 ** 3)))
-MAX_VALIDATIONS = int(os.getenv('FLF_MAX_VALIDATIONS', '2'))
+reaper_thread = None
+lease_status = {'state': 'starting'}
+cleanup_thread = None
+cleanup_status = {'state': 'starting', 'pending': 0, 'deferred': 0}
+active_staging = set()
+MAX_JOBS = limit('max_jobs')
+MAX_QUEUE = limit('max_queue')
+MAX_STORAGE = limit('max_storage')
+MAX_VALIDATIONS = limit('max_validations')
 upload_reservations = {}
 INSUFFICIENT = '제공된 강의 자료에서 답변에 필요한 근거를 찾을 수 없습니다.'
 
@@ -90,7 +96,7 @@ def reserve_upload(who):
             raise HTTPException(429, '전역 대기 작업 한도입니다.')
         disk_bytes = sum(path.stat().st_size for path in store.root.iterdir() if path.is_file())
         # Includes worst-case multipart spool + admitted media file, before parsing.
-        db_budget = int(os.getenv('FLF_MAX_DB_BYTES', str(64 * 1024 ** 2)))
+        db_budget = limit('max_db_bytes')
         if disk_bytes + db_budget + (reserved + 1) * (2 * MAX_BYTES + 1024 * 1024) > MAX_STORAGE:
             raise HTTPException(507, '전역 저장 공간 한도입니다.')
         upload_reservations[who] = upload_reservations.get(who, 0) + 1
@@ -109,6 +115,7 @@ def delete_job(job):
     # leaves a hidden, resumable tombstone, never a runnable job missing its file.
     store.request_delete(job)
     Path(job['path']).unlink(missing_ok=True)
+    provider.cleanup(job)
     store.finish_delete(job['id'])
 
 
@@ -123,21 +130,85 @@ def worker_tick():
                 job = store.get(row[0])
                 if not job:
                     continue
-                if job.get('deleting') or time.time() - job['created'] > 7 * 86400:
-                    delete_job(job)
+                if job.get('deleting') or job.get('leaseUntil', float('inf')) <= time.time():
                     continue
-                if not (job['mode'] == provider.mode and job['submitted'] and job['state'] not in ('FAILED', 'COMPLETED')):
+                if 'leaseUntil' not in job or job.get('legacyReadOnly') or store.has_conflict(job['id']):
+                    # Preserve legacy data without silently running old paid jobs.
+                    continue
+                if not (job['mode'] == provider.mode and job['submitted']
+                        and (job['state'] not in ('FAILED', 'COMPLETED') or store.callback_pending(job['id']))):
                     continue
                 with mutex:
                     active.add(job['id'])
                 try:
-                    store.run(job, provider, stopping.is_set)
+                    def cancelled():
+                        current = store.get(job['id'])
+                        return stopping.is_set() or not current or current.get('deleting') or current.get('leaseUntil', float('inf')) <= time.time()
+                    store.run(job, provider, cancelled)
                 finally:
                     with mutex:
                         active.discard(job['id'])
         except HTTPException as e:
             if e.status_code != 409:
                 raise
+        except ProviderError:
+            # Tombstone retained; next tick retries idempotent object DELETE.
+            store.defer_cleanup(row[0])
+            continue
+
+
+def reap_leases():
+    # Separate from provider I/O: an STT/chat timeout must not delay local expiry.
+    while not stopping.wait(limit('reaper_milliseconds') / 1000):
+        try:
+            with mutex:
+                store.reconcile_staging(active_staging)
+            with store.connect() as c:
+                rows = c.execute("SELECT payload FROM jobs WHERE json_extract(payload,'$.leaseUntil')<=?",
+                                 (time.time(),)).fetchall()
+            for row in rows:
+                job = json.loads(row[0])
+                if job.get('leaseUntil', float('inf')) <= time.time():
+                    store.request_delete(job)
+                    Path(job['path']).unlink(missing_ok=True)
+            lease_status['state'] = 'healthy'
+        except (OSError, sqlite3.Error):
+            lease_status['state'] = 'recovering'
+            stopping.wait(2)
+
+
+def cleanup_tick():
+    with store.connect() as c:
+        rows = c.execute("SELECT id FROM jobs WHERE coalesce(json_extract(payload,'$.deleting'),0) "
+                          "OR json_extract(payload,'$.leaseUntil')<=?", (time.time(),)).fetchall()
+    cleanup_status.update(pending=len(rows), deferred=0)
+    for row in rows:
+        if stopping.is_set():
+            return
+        try:
+            with job_guard(row[0]):
+                job = store.get(row[0])
+                if job and job.get('cleanupAfter', 0) > time.time():
+                    cleanup_status['deferred'] += 1
+                if job and job.get('cleanupAfter', 0) <= time.time():
+                    delete_job(job)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+        except ProviderError:
+            store.defer_cleanup(row[0])
+            cleanup_status['deferred'] += 1
+
+
+def cleanup_worker():
+    # Independent provider-delete queue: STT/chat/PUT on A never blocks cleanup of B.
+    while not stopping.wait(limit('cleanup_milliseconds') / 1000):
+        try:
+            cleanup_tick()
+            cleanup_status['state'] = 'healthy'
+        except (OSError, sqlite3.Error):
+            cleanup_status['state'] = 'recovering'
+            stopping.wait(2)
 
 
 def worker():
@@ -163,21 +234,32 @@ def worker():
 
 @asynccontextmanager
 async def lifespan(app):
-    global worker_thread
+    global worker_thread, reaper_thread, cleanup_thread
     if not all(shutil.which(binary) for binary in ('ffmpeg', 'ffprobe')):
         raise RuntimeError('Install ffmpeg and ffprobe before starting FLF')
     # Enforce one process/worker for this SQLite Draft, including restart recovery.
     lock = (store.root / 'worker.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # No other process may own active staging under this lock. Legacy unregistered files untouched.
+    with mutex:
+        store.reconcile_staging(active_staging)
     stopping.clear()
     with mutex:
         worker_status.update(state='starting', failures=0, error=None)
     thread = threading.Thread(target=worker, daemon=True)
     worker_thread = thread
     thread.start()
+    lease_status['state'] = 'starting'
+    reaper_thread = threading.Thread(target=reap_leases, daemon=True)
+    reaper_thread.start()
+    cleanup_status.update(state='starting', pending=0, deferred=0)
+    cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
+    cleanup_thread.start()
     yield
     stopping.set()
     await asyncio.to_thread(thread.join, 100)
+    await asyncio.to_thread(reaper_thread.join, 5)
+    await asyncio.to_thread(cleanup_thread.join, 100)
     lock.close()
 
 
@@ -222,7 +304,8 @@ app.add_middleware(BodyLimit)
 
 @app.middleware('http')
 async def security(request, call_next):
-    if request.method not in ('GET', 'HEAD'):
+    callback = request.url.path.startswith('/api/speech/callback/')
+    if request.method not in ('GET', 'HEAD') and not callback:
         if request.headers.get('x-flf-request') != '1':
             return JSONResponse({'detail': 'Same-origin request required'}, status_code=403)
         origin = request.headers.get('origin')
@@ -271,20 +354,27 @@ def owned(request, id, allow_deleting=False):
         raise HTTPException(404, '작업을 찾을 수 없습니다.')
     if job.get('deleting') and not allow_deleting:
         raise HTTPException(410, '삭제 처리 중인 작업입니다.')
+    if job.get('leaseUntil', float('inf')) <= time.time() and not allow_deleting:
+        raise HTTPException(410, '강의 세션이 만료되었습니다.')
     return job
 
 
 def public(job):
-    return {k: v for k, v in job.items() if k not in ('owner', 'path', 'token')}
+    return {**{k: v for k, v in job.items() if k not in ('owner', 'path', 'token', 'objects', 'mediaDigest', 'uploadMarker', 'callback', 'speechReceipt')},
+            'quarantined': 'leaseUntil' not in job}
 
 
 @app.get('/api/session')
 def session(request: Request):
     result = JSONResponse({'mode': provider.mode, 'translationLabel': os.getenv('FLF_TRANSLATION_LABEL', 'Transition'),
-                           'maxBytes': MAX_BYTES, 'maxSeconds': MAX_SECONDS})
-    if len(request.cookies.get('flf_session', '')) != 64:
-        result.set_cookie('flf_session', secrets.token_hex(32), httponly=True, samesite='strict',
-                          secure=os.getenv('FLF_SECURE_COOKIE') == '1', max_age=7 * 86400)
+                           'maxBytes': MAX_BYTES, 'maxSeconds': MAX_SECONDS,
+                           'heartbeatSeconds': limit('heartbeat_seconds')})
+    token = request.cookies.get('flf_session', '')
+    if len(token) != 64:
+        token = secrets.token_hex(32)
+    # Reissue without Max-Age, including migration of legacy persistent cookies.
+    result.set_cookie('flf_session', token, httponly=True, samesite='strict',
+                      secure=os.getenv('FLF_SECURE_COOKIE') == '1')
     return result
 
 
@@ -292,7 +382,8 @@ def session(request: Request):
 def jobs(request: Request):
     with store.connect() as c:
         rows = c.execute('SELECT payload FROM jobs WHERE owner=? ORDER BY created DESC', (owner(request),)).fetchall()
-    return [public(job) for r in rows if not (job := json.loads(r[0])).get('deleting')]
+    return [public(job) for r in rows if not (job := json.loads(r[0])).get('deleting')
+            and job.get('leaseUntil', float('inf')) > time.time()]
 
 
 @app.post('/api/jobs')
@@ -317,6 +408,13 @@ def save_upload(request, audio, consent):
         audio.file.close()
         raise HTTPException(400, '지원하지 않는 오디오 형식입니다.')
     path = store.root / (secrets.token_hex(24) + '.' + suffix)
+    with mutex:
+        active_staging.add(str(path))
+        try:
+            store.stage_upload(path)
+        except Exception:
+            active_staging.discard(str(path))
+            raise
     digest = hashlib.sha256()
     total = 0
     try:
@@ -327,9 +425,21 @@ def save_upload(request, audio, consent):
                     raise ValueError('파일 크기 제한을 초과했습니다.')
                 digest.update(block)
                 out.write(block)
+            out.flush()
+            os.fsync(out.fileno())
+        directory = os.open(store.root, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         validate_audio(path, suffix, MAX_BYTES, MAX_SECONDS)
         with mutex:
-            job = store.create(who, digest.hexdigest(), provider.mode, path)
+            request_id = request.headers.get('x-flf-upload-id')
+            if request_id:
+                import re
+                if not re.fullmatch(r'[A-Za-z0-9-]{16,80}', request_id):
+                    raise ValueError('유효하지 않은 업로드 요청 ID입니다.')
+            job = store.create(who, digest.hexdigest(), provider.mode, path, request_id)
         return public(job)
     except ValueError as e:
         path.unlink(missing_ok=True)
@@ -338,6 +448,8 @@ def save_upload(request, audio, consent):
         path.unlink(missing_ok=True)
         raise
     finally:
+        with mutex:
+            active_staging.discard(str(path))
         audio.file.close()
 
 
@@ -346,10 +458,38 @@ def get_job(request: Request, id: str):
     return public(owned(request, id))
 
 
+@app.post('/api/speech/callback/{id}/{secret}')
+async def speech_callback(request: Request, id: str, secret: str):
+    auth = await asyncio.to_thread(store.callback_auth, id, secret)
+    if auth == 'ended':
+        return Response(status_code=204)  # Never recreate a job or keep a late result.
+    if auth != 'active':
+        raise HTTPException(404, 'Callback not found')
+    cap = limit('max_provider_response_bytes')
+    body = bytearray()
+    async for block in request.stream():
+        if len(body) + len(block) > cap:
+            raise HTTPException(413, 'Callback too large')
+        body.extend(block)
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError()
+    except (ValueError, UnicodeError, RecursionError):
+        raise HTTPException(400, 'Invalid callback JSON') from None
+    try:
+        accepted = await asyncio.to_thread(store.accept_callback, id, secret, data)
+    except ProviderError as exc:
+        raise HTTPException(409, exc.code) from None
+    return Response(status_code=200 if accepted else 204)
+
+
 @app.post('/api/jobs/{id}/submit')
 def submit(request: Request, id: str):
     with job_guard(id):
         job = owned(request, id)
+        if 'leaseUntil' not in job or job.get('legacyReadOnly'):
+            raise HTTPException(409, '구 강의는 채택 후 기존 결과 조회/종료만 지원합니다. 처리 재개 기능은 없습니다.')
         if job['mode'] != provider.mode:
             raise HTTPException(409, '현재 서버 모드와 작업 모드가 다릅니다.')
         if job['state'] == 'CREATED' and id not in active:
@@ -362,6 +502,8 @@ def submit(request: Request, id: str):
 def retry(request: Request, id: str):
     with job_guard(id):
         job = owned(request, id)
+        if 'leaseUntil' not in job or job.get('legacyReadOnly') or job.get('callbackError'):
+            raise HTTPException(409, '격리/제공자 종료 작업은 자동 재전송할 수 없습니다.')
         if job['mode'] != provider.mode:
             raise HTTPException(409, '현재 서버 모드와 작업 모드가 다릅니다.')
         if id in active:
@@ -391,6 +533,45 @@ def remove(request: Request, id: str):
     return {'deleted': True}
 
 
+@app.post('/api/jobs/{id}/heartbeat')
+def heartbeat(request: Request, id: str):
+    owned(request, id)
+    if not store.heartbeat(id):
+        raise HTTPException(410, '강의 세션이 종료되었습니다.')
+    return {'active': True}
+
+
+@app.post('/api/jobs/{id}/adopt')
+def adopt(request: Request, id: str):
+    with job_guard(id):
+        owned(request, id)
+        try:
+            return public(store.adopt(id))
+        except ProviderError as exc:
+            raise HTTPException(409, exc.code) from None
+
+
+@app.post('/api/jobs/{id}/end')
+def end_session(request: Request, id: str):
+    job = owned(request, id, allow_deleting=True)
+    store.request_delete(job)
+    Path(job['path']).unlink(missing_ok=True)
+    if job.get('objects'):
+        # Never hold the browser's end response open on external storage I/O.
+        return JSONResponse({'ended': True, 'cleanupPending': True}, status_code=202)
+    try:
+        with job_guard(id):
+            delete_job(job)
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        return JSONResponse({'ended': True, 'cleanupPending': True}, status_code=202)
+    except ProviderError:
+        store.defer_cleanup(id)
+        return JSONResponse({'ended': True, 'cleanupPending': True}, status_code=202)
+    return {'ended': True, 'cleanupPending': False}
+
+
 class Question(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     requestId: str = Field(min_length=16, max_length=80, pattern=r'^[a-zA-Z0-9-]+$')
@@ -400,6 +581,8 @@ class Question(BaseModel):
 def chat(request: Request, id: str, question: Question):
     with job_guard(id):
         job = owned(request, id)
+        if 'leaseUntil' not in job or job.get('legacyReadOnly'):
+            raise HTTPException(409, '구 강의는 채택 후 기존 결과 조회/종료만 지원합니다. 새 질의/처리 재개 기능은 없습니다.')
         if job['mode'] != provider.mode:
             raise HTTPException(409, '현재 서버 모드와 작업 모드가 다릅니다.')
         if not job['summary']:
@@ -428,10 +611,15 @@ def chat(request: Request, id: str, question: Question):
                         '요약 및 인용 근거만으로 답변하고 [source 번호]를 인용하세요. '
                         '근거가 불충분하면 다음 문장만 답하세요: ' + INSUFFICIENT, data))
                 except ProviderError as e:
+                    if e.code == 'SESSION_ENDED':
+                        raise HTTPException(410, '강의 세션이 종료되었습니다.') from None
                     store.chat_failed(id, question.requestId, e.code.startswith('AMBIGUOUS'))
                     raise HTTPException(502, e.code) from None
         turn = {'requestId': question.requestId, 'question': question.text, 'answer': answer, 'evidence': refs}
-        store.chat_finish(id, turn)
+        try:
+            store.chat_finish(id, turn)
+        except ProviderError:
+            raise HTTPException(410, '강의 세션이 종료되었습니다.') from None
         return turn
 
 
@@ -453,13 +641,16 @@ def health():
 
 
 def worker_ready():
-    return bool(worker_thread and worker_thread.is_alive() and worker_status['state'] == 'healthy')
+    return bool(worker_thread and worker_thread.is_alive() and worker_status['state'] == 'healthy'
+                and reaper_thread and reaper_thread.is_alive() and lease_status['state'] == 'healthy'
+                and cleanup_thread and cleanup_thread.is_alive() and cleanup_status['state'] == 'healthy')
 
 
 @app.get('/ready')
 def readiness():
     ready = worker_ready()
-    return JSONResponse({'ready': ready, 'worker': dict(worker_status)}, status_code=200 if ready else 503)
+    return JSONResponse({'ready': ready, 'worker': dict(worker_status), 'leaseReaper': dict(lease_status),
+                         'cleanupWorker': dict(cleanup_status)}, status_code=200 if ready else 503)
 
 
 @app.get('/')

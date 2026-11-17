@@ -31,7 +31,7 @@ def test_fr23_ac04_every_actual_outbound_chat_system_contains_untrusted_summary(
     internal['transcript']+=' TRANSCRIPT_COMMAND_DO_NOT_PROMOTE_TO_SYSTEM'
     module.store.save(internal)
     monkeypatch.setattr(module.provider,'mode','live')
-    monkeypatch.setenv('STUDIO_KEY','mock-only')
+    monkeypatch.setenv('CLOVASTUDIO_API_KEY','mock-only')
     requests=[]
     def request(method,url,**kw):
         requests.append(kw['json'])
@@ -185,7 +185,8 @@ def test_ac09_refresh_same_job_no_duplicate(client):
         client.get('/api/session')
         assert client.get('/api/jobs/'+j['id']).json()['id']==j['id']
         assert client.get('/api/jobs').json()[0]['id']==j['id']
-    assert upload(client).json()['id']==j['id']
+    # Confirmed policy: refresh reuses the active session; a NEW upload does not.
+    assert upload(client).json()['id']!=j['id']
     with module.store.connect() as c: assert c.execute('SELECT sum(attempts) FROM calls').fetchone()[0]==before
 
 

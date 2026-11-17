@@ -1,0 +1,4 @@
+# Final public anonymous mode; same HTTP redirect, TLS and loopback topology.
+geo $flf_allowed {
+    default 1;
+}
